@@ -364,11 +364,53 @@ def test_a_description_finds_nearby_candidates():
         {"type": "way", "center": {"lat": 51.5070, "lon": -0.0900},
          "tags": {"name": "Tonkotsu Bankside", "cuisine": "ramen"}},
     ]}
-    data = run(spot_app({"nominatim": area, "overpass-api": overpass}, spots=[]),
+    # The map search near London Bridge finds nothing, so the tag search is tried.
+    data = run(spot_app({"nominatim": [(area,), ([],)], "overpass-api": overpass}, spots=[]),
                "london.find_spot", {"description": "ramen near London Bridge"}).data
     assert data["source"] == "description"
     assert data["name"] == "Hakata Ramen"
     assert any("Tonkotsu" in other for other in data["other_matches"])
+
+
+def test_a_description_is_searched_on_the_map_near_the_area():
+    area = [{"lat": "51.5055", "lon": "-0.0860", "name": "London Bridge",
+             "display_name": "London Bridge, London, United Kingdom", "address": {}}]
+    nearby = [{"lat": "51.5041", "lon": "-0.0868", "name": "Kauboi Ramen", "type": "restaurant",
+               "display_name": "Kauboi Ramen, 1 Duke Street Hill, London, United Kingdom",
+               "address": {"suburb": "Borough"}}]
+    data = run(spot_app({"nominatim": [(area,), (nearby,)]}, spots=[]),
+               "london.find_spot", {"description": "ramen near London Bridge"}).data
+    assert data["name"] == "Kauboi Ramen" and data["area"] == "Borough"
+    assert data["type"] == "ramen restaurant"
+
+
+def test_a_vague_description_is_searched_on_wikipedia():
+    wiki = {"pages": [
+        {"title": "Glass", "description": "Amorphous solid"},
+        {"title": "Sky Garden", "description": "Public garden at 20 Fenchurch Street, London"},
+        {"title": "Kew Gardens", "description": "Botanical garden in London"},
+    ]}
+    sky = [{"lat": "51.5111", "lon": "-0.0835", "name": "Sky Garden", "type": "garden",
+            "display_name": "Sky Garden, 20 Fenchurch Street, London, United Kingdom",
+            "address": {"suburb": "City of London"}}]
+    data = run(spot_app({"search/page": wiki, "nominatim": sky}, spots=[]),
+               "london.find_spot", {"description": "garden with a glass dome on a skyscraper"}).data
+    assert data["name"] == "Sky Garden" and data["source"] == "description"
+    assert data["other_matches"] == ["Kew Gardens (Botanical garden in London)"]
+
+
+def test_nothing_found_falls_back_to_a_google_maps_search():
+    data = run(spot_app({"search/page": {"pages": []}, "nominatim": []}, spots=[]),
+               "london.find_spot", {"description": "tiny blue door cafe"}).data
+    assert data["source"] == "maps_search"
+    assert data["directions_url"].startswith("https://www.google.com/maps/search/?")
+    assert "tiny+blue+door+cafe" in data["directions_url"]
+
+
+def test_wikipedia_down_still_answers():
+    data = run(spot_app({"search/page": TimeoutError("slow"), "nominatim": []}, spots=[]),
+               "london.find_spot", {"description": "that shop with the purple door"}).data
+    assert data["source"] == "maps_search"
 
 
 def test_only_a_link_is_refused_and_never_fetched():

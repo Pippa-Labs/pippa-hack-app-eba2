@@ -229,8 +229,10 @@ outcomes:
         required: false
         description: >-
           What the person remembers about the place, in their words, for
-          example "ramen near London Bridge", "rooftop bar" or "glass dome".
-          Keep any "near ..." part. If there is none, return an empty string.
+          example "ramen near London Bridge", "rooftop bar" or "garden with a
+          glass dome". Whenever the message describes a place in any way, put
+          the whole description here, keeping any "near ..." part. Only if
+          there is no description at all, return an empty string.
       - name: start
         type: string
         required: false
@@ -252,7 +254,11 @@ outcomes:
         description: A Google Maps link with public transport directions.
       - name: source
         type: string
-        description: '"saved" (from their saved spots), "lookup" (found by name) or "description".'
+        description: >-
+          Where the answer came from: "saved" (their saved spots), "lookup"
+          (found from its name), "description" (found from what they
+          described) or "maps_search" (not pinned down, so directions_url is
+          a Google Maps search for their words).
       - name: other_matches
         type: array
         item_type: string

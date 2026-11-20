@@ -197,7 +197,34 @@ PLACE_TYPES = [
     ("garden", "leisure", "garden", "garden"),
     ("park", "leisure", "park", "park"),
     ("bookshop", "shop", "books", "bookshop"),
+    ("bubble tea", "cuisine", "bubble_tea", "bubble tea shop"),
+    ("ice cream", "amenity", "ice_cream", "ice cream shop"),
+    ("dessert", "amenity", "ice_cream", "dessert shop"),
+    ("noodle", "cuisine", "noodle", "noodle bar"),
+    ("dumpling", "cuisine", "dumplings", "dumpling restaurant"),
+    ("burger", "cuisine", "burger", "burger place"),
+    ("korean", "cuisine", "korean", "Korean restaurant"),
+    ("japanese", "cuisine", "japanese", "Japanese restaurant"),
+    ("chinese", "cuisine", "chinese", "Chinese restaurant"),
+    ("thai", "cuisine", "thai", "Thai restaurant"),
+    ("indian", "cuisine", "indian", "Indian restaurant"),
+    ("italian", "cuisine", "italian", "Italian restaurant"),
+    ("cinema", "amenity", "cinema", "cinema"),
+    ("theatre", "amenity", "theatre", "theatre"),
+    ("church", "amenity", "place_of_worship", "church"),
+    ("library", "amenity", "library", "library"),
+    ("hotel", "tourism", "hotel", "hotel"),
 ]
+# The first match wins, so specific kinds ("noodle bar") go before generic ones ("bar").
+GENERIC_TYPES = {"bar", "pub", "restaurant", "cafe", "coffee", "view", "park", "garden", "market"}
+PLACE_TYPES.sort(key=lambda t: t[0] in GENERIC_TYPES)
+UK_WORDS = ("london", "uk", "england", "scotland", "wales", "britain", "edinburgh",
+            "manchester", "bristol", "oxford", "cambridge", "brighton", "bath", "york")
+# A Wikipedia hit only counts as a place if its short description says so.
+PLACE_WORDS = ("london", "england", "scotland", "wales", "building", "restaurant", "park",
+               "garden", "museum", "street", "market", "bar", "pub", "station", "church",
+               "cathedral", "bridge", "tower", "gallery", "theatre", "landmark", "venue",
+               "hotel", "palace", "castle", "square", "district", "skyscraper", "shop")
 WALK_KMH = 5.0
 SPOT_BUDGET_S = 13.0  # stop adding extras after this, inside the 20 s limit
 LONDON_WORDS = ("london", "westminster", "thames", "buckingham palace", "tower bridge")
@@ -238,12 +265,18 @@ class SpotsMixin:
         if saved:
             found, source = saved[0], "saved"
             others = [_spot_line(s) for s in saved[1:4]]
-        elif spot_text:
-            found, source = self._geocode(spot_text, 4.0), "lookup"
-        elif description:
-            candidates = self._search_described(description)
-            found, source = candidates[0], "description"
-            others = [_spot_line(c) for c in candidates[1:3]]
+        elif spot_text or description:
+            try:
+                if not spot_text:
+                    raise PlaceNotFound("no name given")
+                found, source = self._geocode(spot_text, 4.0), "lookup"
+            except PlaceNotFound:
+                # Not on the map by that name: treat everything they said as a description.
+                described = f"{spot_text} {description}".strip()
+                candidates = self._search_described(described, started)
+                found = candidates[0]
+                source = found.pop("_source", "description")
+                others = [_spot_line(c) for c in candidates[1:3]]
         else:
             raise SpotNotFound("no usable spot name or description")
 
@@ -276,8 +309,15 @@ class SpotsMixin:
         destination = (_latlon(found) if has_coords
                        else f"{found['name']} {data['address']}".strip())
         data["directions_url"] = _maps_link(destination, _latlon(origin) if origin else "")
+        if source == "maps_search":
+            data["directions_url"] = ("https://www.google.com/maps/search/?"
+                                      + urlencode({"api": "1", "query": found["name"]}))
+            return Result(data=data, narrative=(
+                f"🔎 Couldn't pin \"{found['name']}\" down myself, mate, but this Google Maps "
+                f"search should find it: {data['directions_url']}"))
 
-        narrative = f"📍 Found it, mate! {_spot_line(found)}"
+        lead = "🤔 Best guess, mate:" if found.pop("_guess", False) else "📍 Found it, mate!"
+        narrative = f"{lead} {_spot_line(found)}"
         if data["address"]:
             narrative += f", {data['address']}"
         if "distance_km" in data:
@@ -325,11 +365,18 @@ class SpotsMixin:
             error = PlaceNotFound(f"nominatim found nothing for {place!r}")
             error.user_message = f"Sorry mate, I couldn't find {place} anywhere in the UK."
             raise error
-        first = results[0]
+        found = self._place_from(results[0], place)
+        if found is None:
+            raise ServiceDown("nominatim result had no coordinates")
+        return found
+
+    @staticmethod
+    def _place_from(first: dict, place: str):
+        """One Nominatim result -> a spot-shaped dict, or None without coordinates."""
         try:
             lat, lon = float(first["lat"]), float(first["lon"])
         except (KeyError, TypeError, ValueError):
-            raise ServiceDown("nominatim result had no coordinates")
+            return None
         address = first.get("address") or {}
         name = (first.get("name") or "").strip() or place
         parts = [p.strip() for p in (first.get("display_name") or "").split(",") if p.strip()]
@@ -344,24 +391,87 @@ class SpotsMixin:
             "lat": lat, "lon": lon,
         }
 
-    def _search_described(self, description: str) -> list[dict]:
-        """'ramen near London Bridge' -> up to 3 nearby places from OpenStreetMap."""
+    def _search_described(self, description: str, started: float) -> list[dict]:
+        """A description -> up to 3 candidate places, trying three searches in turn.
+
+        1. "ramen near London Bridge": that type of place near that area (Overpass).
+        2. "garden with a glass dome": a Wikipedia search, then the map.
+        3. Anything else: a free-text OpenStreetMap search.
+        """
+        for search in (self._search_nearby, self._search_web, self._search_map):
+            if self._clock() - started > SPOT_BUDGET_S:
+                break
+            try:
+                found = search(description)
+            except AgentAppError:
+                found = []  # that search failed or found nothing: try the next
+            if found:
+                return found
+        # Nothing pinned it down: hand Google Maps the words to search with.
+        return [{"name": description[:120], "type": "", "area": "", "address": "",
+                 "_source": "maps_search"}]
+
+    def _search_web(self, description: str) -> list[dict]:
+        """Search Wikipedia with the description, and put the best place hit on the map."""
+        query = description
+        if not any(w in description.lower() for w in UK_WORDS):
+            query += " London"
+        reply = self._get_json("https://en.wikipedia.org/w/rest.php/v1/search/page?"
+                               + urlencode({"q": query, "limit": 5}), "Wikipedia", 4.0)
+        def is_uk_place(page: dict) -> bool:
+            words = (page.get("description") or "").lower()
+            return (any(w in words for w in PLACE_WORDS)
+                    and any(w in words for w in UK_WORDS))
+
+        pages = [p for p in (reply or {}).get("pages") or [] if p.get("title") and is_uk_place(p)]
+        for page in pages[:2]:
+            try:
+                place = self._geocode(page["title"], 3.0)
+            except PlaceNotFound:
+                continue
+            place["name"] = page["title"]
+            place["type"] = page.get("description") or place["type"]
+            place["_guess"] = True
+            others = [{"name": p["title"], "type": p.get("description") or ""}
+                      for p in pages if p is not page][:2]
+            return [place] + others
+        return []
+
+    def _search_map(self, description: str) -> list[dict]:
+        """A plain OpenStreetMap search with the words they used."""
+        return [self._geocode(description, 3.0)]
+
+    def _search_nearby(self, description: str) -> list[dict]:
+        """'ramen near London Bridge' -> up to 3 places of that kind near that area."""
         lowered = description.lower()
         kind = next((t for t in PLACE_TYPES if re.search(rf"\b{t[0]}", lowered)), None)
         area_match = AREA.search(description)
         if not kind or not area_match:
-            error = SpotNotFound(f"cannot search for {description!r}")
-            if kind:
-                error.user_message = (f"Ooh, sounds good! Roughly where's the {kind[3]}, mate? "
-                                      "Say something like \"near London Bridge\".")
-            raise error
+            return []
         area = self._geocode(area_match.group(1).strip(" .?!"), 4.0)
+        # The map search, kept to about a kilometre round the area: quick and reliable.
+        box = (f"{area['lon'] - 0.015:.5f},{area['lat'] + 0.009:.5f},"
+               f"{area['lon'] + 0.015:.5f},{area['lat'] - 0.009:.5f}")
+        words = "rooftop bar" if kind[0] == "rooftop" else kind[0]
+        try:
+            results = self._nominatim({"q": words, "format": "jsonv2", "limit": 3,
+                                       "viewbox": box, "bounded": 1, "addressdetails": 1}, 3.0)
+        except AgentAppError:
+            results = []
+        found = [p for p in (self._place_from(r, "") for r in results or []) if p and p["name"]]
+        for place in found:
+            place["type"] = kind[3]
+            place["area"] = place["area"] or area["name"]
+        return found or self._search_overpass(kind, area)
+
+    def _search_overpass(self, kind: tuple, area: dict) -> list[dict]:
+        """The backup: OpenStreetMap's tag search (finds ramen shops without "ramen" in the name)."""
         word, key, value, label = kind
         query = (f'[out:json][timeout:6];nwr["{key}"="{value}"]["name"]'
                  f'(around:900,{_latlon(area)});out center 25;')
         reply = self._get_json(
             "https://overpass-api.de/api/interpreter?" + urlencode({"data": query}),
-            "OpenStreetMap", 7.0)
+            "OpenStreetMap", 4.0)
         found = []
         for element in (reply or {}).get("elements", []):
             tags = element.get("tags") or {}
@@ -377,10 +487,7 @@ class SpotsMixin:
                 "address": ", ".join(b for b in (street, tags.get("addr:postcode")) if b),
                 "lat": lat, "lon": lon}))
         if not found:
-            error = SpotNotFound(f"overpass found no {value} near {area['name']!r}")
-            error.user_message = (f"Couldn't spot a {label} near {area['name']}, mate. "
-                                  "Remember what it's called?")
-            raise error
+            return []
         found.sort(key=lambda item: (item[0], item[1]))
         return [spot for _, _, spot in found[:3]]
 
