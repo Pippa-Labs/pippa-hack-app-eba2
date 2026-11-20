@@ -1,178 +1,614 @@
-"""Your app. Replace this with whatever you are building.
+"""London Local: three small London helpers in one app.
 
-The shape never changes, whatever your app does:
+    london.outfit   what to wear for the weather, drawn as an emoji avatar
+    london.jog      a jogging route out to a park and back, for a distance
+    london.journey  how to get from A to B, and which strikes or delays hit it
 
-    class App:
-        manifest  -> the parsed manifest.yaml sitting next to this file
-        handle(call) -> Result
+Data sources, all free and keyless:
+    Open-Meteo        weather forecast
+    Nominatim (OSM)   turning a place name into coordinates
+    TfL Unified API   journey planner and live line status
 
-`handle` is called once per request and must return a `Result` whose `data`
-matches the `output` your manifest declares for that outcome — exactly: every
-declared field present, nothing extra, right types. The runtime checks it and
-refuses anything that does not match, which is deliberate. An app that can
-return surprise fields is an app Pippa cannot describe to a user before they
-install it.
-
-Three things worth knowing before you start:
-
-**You get the inputs, and nothing about who asked.** No user id, no account,
-no conversation. `call.inputs` is what Pippa extracted from the message;
-besides it, `call.context` carries only the time, an id for your logs, and
-whether the person picked your app by name. This is on purpose: your app
-cannot leak what it was never given.
-
-**You keep nothing.** A fresh copy of this class is built for every call and
-thrown away afterwards. Writing to a file or a global will appear to work and
-then silently stop, because the next call may be on a different machine.
-
-**Errors are part of the design.** Raise `AgentAppError` with a `user_message`
-when you cannot answer. That message is the one a user may see; everything
-else — the exception type, the traceback — stays in the logs.
+Every request goes through `_fetch`, so the tests can replace it.
 """
 
 from __future__ import annotations
 
+import json
+import math
+import re
+import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from pippa_agentapp_sdk import (
     AgentAppError,
     Call,
     Manifest,
+    RateLimitedError,
     Result,
+    ServiceUnavailableError,
     load_manifest_file,
     validate_manifest,
 )
 
 MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
+LONDON = ZoneInfo("Europe/London")
+
+#: Nominatim answers 403 without a descriptive User-Agent.
+USER_AGENT = "pippa-agent-app-london-local/0.1 (https://github.com/Pippa-Labs)"
+
+#: Greater London, as Nominatim's viewbox (left, top, right, bottom).
+LONDON_VIEWBOX = "-0.56,51.72,0.34,51.27"
+CENTRAL_LONDON = (51.5074, -0.1278)
+
+#: Streets are not straight lines: a walking route is roughly this much longer
+#: than the distance as the crow flies.
+STREET_FACTOR = 1.3
 
 
-class CannotReadDate(AgentAppError):
-    """Raised when the message did not contain a date we can work with."""
+# ── Errors a person may see ─────────────────────────────────────────────────
 
-    # What a user may be shown. Write it as a sentence, not an error code.
-    user_message = "I could not work out which date you meant."
+
+class PlaceNotFound(AgentAppError):
+    user_message = "I could not find that place in London."
     retryable = False
 
 
-class App:
-    """A small, complete example: count the days until a date."""
+class CannotReadDay(AgentAppError):
+    user_message = "I can only forecast the next 7 days. Try a day name like Saturday, or tomorrow."
+    retryable = False
 
+
+class MissingPlace(AgentAppError):
+    user_message = "Tell me where you are starting from and where you are going, for example: from Imperial College to Ealing Broadway."
+    retryable = False
+
+
+class BadDistance(AgentAppError):
+    user_message = "Pick a run between 1 and 42 km, for example: a 5 km jog from Imperial College."
+    retryable = False
+
+
+class NoJourney(AgentAppError):
+    user_message = "TfL could not find a public transport route between those two places."
+    retryable = False
+
+
+class ServiceBusy(RateLimitedError):
+    pass
+
+
+class ServiceDown(ServiceUnavailableError):
+    pass
+
+
+# ── Parks for the jogging routes ────────────────────────────────────────────
+# Centre point, an approximate length of one lap round its paths in km, and
+# something worth running past. Lap lengths are rounded estimates.
+
+PARKS = [
+    ("Hyde Park", 51.5073, -0.1657, 5.0, "the Serpentine"),
+    ("Kensington Gardens", 51.5067, -0.1795, 4.0, "the Round Pond and Kensington Palace"),
+    ("Holland Park", 51.5030, -0.2040, 2.0, "the Kyoto Garden"),
+    ("Green Park", 51.5040, -0.1425, 2.0, "Buckingham Palace"),
+    ("St James's Park", 51.5025, -0.1340, 2.3, "the lake and Horse Guards Parade"),
+    ("Regent's Park", 51.5313, -0.1570, 4.5, "the Outer Circle and the boating lake"),
+    ("Primrose Hill", 51.5395, -0.1610, 1.5, "the view over the city from the top"),
+    ("Battersea Park", 51.4791, -0.1566, 4.0, "the river and the Peace Pagoda"),
+    ("Clapham Common", 51.4596, -0.1497, 4.5, "the ponds and the bandstand"),
+    ("Wandsworth Common", 51.4530, -0.1700, 3.5, "the lakes"),
+    ("Brockwell Park", 51.4500, -0.1060, 2.5, "the hilltop view and the lido"),
+    ("Burgess Park", 51.4830, -0.0870, 3.0, "the lake"),
+    ("Southwark Park", 51.4950, -0.0550, 2.5, "the boating lake"),
+    ("Greenwich Park", 51.4769, -0.0005, 3.5, "the Royal Observatory hill"),
+    ("Victoria Park", 51.5362, -0.0400, 4.5, "the lakes and the Chinese pagoda"),
+    ("Mile End Park", 51.5190, -0.0330, 3.0, "the Green Bridge and the canal"),
+    ("Clissold Park", 51.5610, -0.0880, 2.0, "the deer enclosure"),
+    ("Finsbury Park", 51.5700, -0.1030, 3.0, "the boating lake"),
+    ("Hampstead Heath", 51.5600, -0.1630, 5.0, "Parliament Hill"),
+    ("Alexandra Park", 51.5940, -0.1300, 3.0, "the view from Alexandra Palace"),
+    ("Ravenscourt Park", 51.4950, -0.2370, 1.6, "the pond"),
+    ("Gunnersbury Park", 51.4960, -0.2900, 3.0, "the boating lake"),
+    ("Richmond Park", 51.4425, -0.2760, 11.0, "the deer and the Tamsin Trail"),
+    ("Wimbledon Common", 51.4340, -0.2350, 6.0, "the windmill"),
+]
+
+
+# ── Weather words ───────────────────────────────────────────────────────────
+
+WEATHER_CODES = {
+    0: ("☀️", "clear sky"), 1: ("🌤️", "mostly clear"), 2: ("⛅", "partly cloudy"),
+    3: ("☁️", "overcast"), 45: ("🌫️", "fog"), 48: ("🌫️", "freezing fog"),
+    51: ("🌦️", "light drizzle"), 53: ("🌦️", "drizzle"), 55: ("🌧️", "heavy drizzle"),
+    56: ("🌧️", "freezing drizzle"), 57: ("🌧️", "freezing drizzle"),
+    61: ("🌧️", "light rain"), 63: ("🌧️", "rain"), 65: ("🌧️", "heavy rain"),
+    66: ("🌧️", "freezing rain"), 67: ("🌧️", "freezing rain"),
+    71: ("🌨️", "light snow"), 73: ("🌨️", "snow"), 75: ("❄️", "heavy snow"),
+    77: ("🌨️", "snow grains"), 80: ("🌦️", "light showers"), 81: ("🌧️", "showers"),
+    82: ("⛈️", "heavy showers"), 85: ("🌨️", "snow showers"), 86: ("❄️", "heavy snow showers"),
+    95: ("⛈️", "thunderstorms"), 96: ("⛈️", "thunderstorms with hail"),
+    99: ("⛈️", "thunderstorms with hail"),
+}
+SNOW_CODES = {71, 73, 75, 77, 85, 86}
+THUNDER_CODES = {95, 96, 99}
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def _km_between(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Straight-line distance in km (haversine)."""
+    lat1, lon1, lat2, lon2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = (math.sin((lat2 - lat1) / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
+    return 6371.0 * 2 * math.asin(math.sqrt(h))
+
+
+def _pretty_day(day: date) -> str:
+    # Built by hand: `%-d` raises on Windows.
+    return f"{day.strftime('%A')} {day.day} {day.strftime('%B')}"
+
+
+class App:
     def __init__(self) -> None:
-        # Validated at construction, so an app whose manifest is wrong fails
-        # immediately and loudly rather than on some later call.
         self._manifest = validate_manifest(load_manifest_file(MANIFEST_PATH))
+        # Replaced in tests so they never wait.
+        self._sleep = time.sleep
 
     @property
     def manifest(self) -> Manifest:
         return self._manifest
 
     def handle(self, call: Call) -> Result:
-        """One request in, one Result out.
+        if call.outcome_id == "london.outfit":
+            return self._outfit(call)
+        if call.outcome_id == "london.jog":
+            return self._jog(call)
+        if call.outcome_id == "london.journey":
+            return self._journey(call)
+        raise AgentAppError(f"this app cannot do {call.outcome_id!r}")
 
-        `call.outcome_id` says which of your manifest's outcomes was asked
-        for. With one outcome you can ignore it; with several, branch on it.
+    # ── Network ─────────────────────────────────────────────────────────────
+
+    def _fetch(self, url: str, timeout: float = 6.0) -> bytes:
+        """Every outbound request goes through here."""
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+
+    def _get_json(self, url: str, service: str, timeout: float):
+        """Fetch and parse JSON, turning network failures into errors people can read.
+
+        Never passes on the provider's error text: only the status code.
         """
-        if call.outcome_id != "days.until":
-            raise AgentAppError(f"this app cannot do {call.outcome_id!r}")
+        try:
+            raw = self._fetch(url, timeout=timeout)
+        except urllib.error.HTTPError as exc:  # must come first: it IS a URLError
+            if exc.code == 429:
+                raise ServiceBusy(f"{service} rate limited")
+            raise ServiceDown(f"{service} returned {exc.code}")
+        except TimeoutError as exc:  # not a URLError
+            raise ServiceDown(f"{service} timed out: {exc}")
+        except urllib.error.URLError as exc:
+            raise ServiceDown(f"could not reach {service}: {exc.reason}")
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise ServiceDown(f"{service} sent something that is not JSON")
 
-        text = (call.inputs.get("date") or "").strip()
-        if not text:
-            # The manifest tells the extractor to send an empty string rather
-            # than guess, so this is the ordinary "they did not say" path.
-            #
-            # A missing or unreadable date (here, and in `_parse` below) is
-            # the only thing this app refuses for, which is why it never reads
-            # `call.context.explicit`, True when the person picked the app
-            # with @. That refusal is right whoever chose the app; the test
-            # that says so is in test_app.py.
-            raise CannotReadDate("no date in the message")
+    def _locate(self, place: str, timeout: float = 4.0) -> tuple[float, float, str]:
+        """A London place name -> (lat, lon, short name)."""
+        query = urlencode({
+            "q": place, "format": "jsonv2", "limit": 1, "countrycodes": "gb",
+            "viewbox": LONDON_VIEWBOX, "bounded": 1,
+        })
+        results = self._get_json(
+            "https://nominatim.openstreetmap.org/search?" + query, "Nominatim", timeout)
+        if not isinstance(results, list) or not results:
+            error = PlaceNotFound(f"nominatim found nothing for {place!r}")
+            error.user_message = f"I could not find {place} in London."
+            raise error
+        first = results[0]
+        try:
+            lat, lon = float(first["lat"]), float(first["lon"])
+        except (KeyError, TypeError, ValueError):
+            raise ServiceDown("nominatim result had no coordinates")
+        name = (first.get("name") or "").strip() or place
+        return lat, lon, name
 
-        # `call.context.now` is the current time, supplied by the runtime
-        # rather than read from the clock. That is what makes an app testable:
-        # a test can say what "now" is.
-        today = self._today(call)
-        target = self._parse(text, today)
-        difference = (target - today).days
+    # ── 1. What to wear ─────────────────────────────────────────────────────
 
-        return Result(
-            data={
-                "days": abs(difference),
-                "target_date": target.isoformat(),
-                "weekday": target.strftime("%A"),
-                "already_passed": difference < 0,
-            },
-            # Optional. One plain sentence Pippa may use when it writes its
-            # reply. Say what you found, not what you did.
-            narrative=self._sentence(target, difference),
+    def _outfit(self, call: Call) -> Result:
+        place = (call.inputs.get("place") or "").strip()
+        now = call.context.now.astimezone(LONDON)
+        day = self._which_day((call.inputs.get("day") or "").strip(), now.date())
+
+        if not place or place.lower() in ("london", "central london"):
+            lat, lon, name = CENTRAL_LONDON[0], CENTRAL_LONDON[1], "London"
+        else:
+            lat, lon, name = self._locate(place)
+
+        query = urlencode({
+            "latitude": f"{lat:.4f}", "longitude": f"{lon:.4f}",
+            "daily": ",".join([
+                "weather_code", "temperature_2m_max", "temperature_2m_min",
+                "apparent_temperature_max", "apparent_temperature_min",
+                "precipitation_probability_max", "precipitation_sum",
+                "wind_speed_10m_max", "uv_index_max",
+            ]),
+            "hourly": "precipitation_probability",
+            "timezone": "Europe/London", "forecast_days": 7,
+        })
+        forecast = self._get_json(
+            "https://api.open-meteo.com/v1/forecast?" + query, "Open-Meteo", 6.0)
+
+        daily = forecast.get("daily") or {}
+        days = daily.get("time") or []
+        key = day.isoformat()
+        if key not in days:
+            raise ServiceDown(f"open-meteo had no forecast for {key}")
+        i = days.index(key)
+
+        def value(field: str, default: float = 0.0) -> float:
+            series = daily.get(field) or []
+            v = series[i] if i < len(series) else None
+            return float(v) if v is not None else default
+
+        code = int(value("weather_code"))
+        t_low, t_high = value("temperature_2m_min"), value("temperature_2m_max")
+        f_low, f_high = value("apparent_temperature_min"), value("apparent_temperature_max")
+        rain_chance = int(round(value("precipitation_probability_max")))
+        rain_mm = value("precipitation_sum")
+        wind = value("wind_speed_10m_max")
+        uv = value("uv_index_max")
+
+        rain_from = self._rain_starts(forecast.get("hourly") or {}, day, now)
+        sky_emoji, sky_words = WEATHER_CODES.get(code, ("🌡️", "mixed weather"))
+        items = self._clothes(code, f_low, f_high, rain_chance, rain_mm, wind, uv)
+
+        avatar = f"{sky_emoji} 🧍 " + "".join(emoji for emoji, _ in items)
+        outfit = ", ".join(f"{emoji} {words}" for emoji, words in items)
+        rain_timing = ""
+        if rain_from:
+            rain_timing = f"rain likely from {rain_from}"
+        elif rain_chance < 30 and rain_mm < 1.0:
+            rain_timing = "staying dry"
+        elif rain_chance >= 30 or rain_mm >= 1.0:
+            rain_timing = "some rain possible"
+
+        data = {
+            "place": name,
+            "day": _pretty_day(day),
+            "conditions": sky_words,
+            "avatar": avatar,
+            "outfit": outfit,
+            "temperature_low_c": round(t_low, 1),
+            "temperature_high_c": round(t_high, 1),
+            "feels_like_low_c": round(f_low, 1),
+            "feels_like_high_c": round(f_high, 1),
+            "rain_chance_percent": rain_chance,
+            "rain_mm": round(rain_mm, 1),
+            "wind_kmh": round(wind, 1),
+        }
+        if rain_timing:
+            data["rain_timing"] = rain_timing
+
+        narrative = (
+            f"Outfit for {name}, {_pretty_day(day)}: {avatar}. {sky_words.capitalize()}, "
+            f"{round(t_low)} to {round(t_high)}°C (feels like {round(f_low)} to {round(f_high)}°C), "
+            f"{rain_chance}% chance of rain"
+            + (f", {rain_timing}" if rain_timing else "") + f". Wear: {outfit}."
         )
+        return Result(data=data, narrative=narrative)
 
     @staticmethod
-    def _today(call: Call) -> date:
-        """The user's today, not the server's.
-
-        A server in UTC and a user in Auckland disagree about what day it is
-        for twelve hours out of every twenty-four, and "how many days until"
-        is exactly the question that notices.
-        """
-        # No try/except around ZoneInfo, and that is the point: the manifest
-        # declares this input as `type: timezone`, so the runtime has already
-        # rejected anything that is not a real IANA zone before your code
-        # runs. Declaring the right type is cheaper than validating by hand,
-        # and the user gets a better error.
-        zone = call.inputs.get("timezone")
-        moment: datetime = call.context.now
-        if zone:
-            moment = moment.astimezone(ZoneInfo(zone))
-        return moment.date()
-
-    @staticmethod
-    def _parse(text: str, today: date) -> date:
-        """Turn what the user wrote into a date.
-
-        Deliberately small — real date parsing is its own project. Handles
-        `YYYY-MM-DD`, `25 December`, `December 25` and a bare day number.
-        """
-        cleaned = text.replace(",", " ").strip()
-
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                return datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
-
-        for fmt in ("%d %B", "%B %d", "%d %b", "%b %d"):
-            try:
-                parsed = datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
-            # A bare day and month has no year. "25 December" asked in
-            # February means this year; asked in December means this year too,
-            # until it has passed, and then it means next year.
-            candidate = parsed.replace(year=today.year)
-            if candidate < today:
-                candidate = candidate.replace(year=today.year + 1)
-            return candidate
-
-        if cleaned.lower() == "tomorrow":
+    def _which_day(text: str, today: date) -> date:
+        words = text.lower().strip(" .?!")
+        if words in ("", "today", "now", "tonight", "this morning", "this afternoon",
+                     "this evening", "later"):
+            return today
+        if words in ("tomorrow", "tmrw", "tomorrow morning", "tomorrow afternoon"):
             return today + timedelta(days=1)
-
-        raise CannotReadDate(f"could not parse {text!r} as a date")
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                wanted = datetime.strptime(words, fmt).date()
+                break
+            except ValueError:
+                continue
+        else:
+            wanted = None
+            for n, name in enumerate(WEEKDAYS):
+                if name in words or words == name[:3]:
+                    ahead = (n - today.weekday()) % 7
+                    if "next" in words and ahead == 0:
+                        ahead = 7
+                    wanted = today + timedelta(days=ahead)
+                    break
+        if wanted is None:
+            raise CannotReadDay(f"could not read {text!r} as a day")
+        if not 0 <= (wanted - today).days <= 6:
+            raise CannotReadDay(f"{wanted} is outside the 7-day forecast")
+        return wanted
 
     @staticmethod
-    def _sentence(target: date, difference: int) -> str:
-        # Built by hand rather than with `%-d`, which is a GNU extension: it
-        # raises ValueError on Windows, where half of you are developing, and
-        # the failure would only show up at the last line of a working app.
-        pretty = (
-            f"{target.strftime('%A')} {target.day} "
-            f"{target.strftime('%B')} {target.year}"
-        )
-        if difference == 0:
-            return f"That is today, {pretty}."
-        if difference < 0:
-            return f"{pretty} was {abs(difference)} days ago."
-        if difference == 1:
-            return f"{pretty} is tomorrow."
-        return f"There are {difference} days until {pretty}."
+    def _rain_starts(hourly: dict, day: date, now: datetime) -> str:
+        """The first hour on that day (from now on, if it is today) with rain likely."""
+        times = hourly.get("time") or []
+        chances = hourly.get("precipitation_probability") or []
+        for stamp, chance in zip(times, chances):
+            if not stamp.startswith(day.isoformat()) or chance is None:
+                continue
+            hour = int(stamp[11:13])
+            if day == now.date() and hour < now.hour:
+                continue
+            if chance >= 50:
+                return f"{hour:02d}:00"
+        return ""
+
+    @staticmethod
+    def _clothes(code, f_low, f_high, rain_chance, rain_mm, wind, uv) -> list[tuple[str, str]]:
+        items: list[tuple[str, str]] = []
+        feel = f_high
+        windy = wind >= 40
+        wet = rain_chance >= 50 or rain_mm >= 1.0
+        very_wet = rain_mm >= 5.0 or (wet and windy)
+
+        if feel < 3:
+            items += [("🧥", "heavy winter coat"), ("🧣", "scarf"), ("🧤", "gloves"), ("🧢", "warm hat")]
+        elif feel < 8:
+            items += [("🧥", "warm coat"), ("🧣", "scarf")]
+            if f_low < 3:
+                items.append(("🧤", "gloves"))
+        elif feel < 13:
+            items += [("🧶", "jumper"), ("🧥", "light jacket")]
+        elif feel < 18:
+            items += [("🧶", "light jumper or long sleeves")]
+        elif feel < 23:
+            items += [("👕", "t-shirt"), ("🧥", "light layer for the evening")]
+        else:
+            items += [("👕", "t-shirt"), ("🩳", "shorts or a light dress")]
+
+        if code in SNOW_CODES:
+            items.append(("🥾", "boots with good grip"))
+        elif very_wet:
+            items += [("🧥", "waterproof raincoat with a hood"), ("👢", "waterproof boots")]
+        if wet and not windy:
+            items.append(("☂️", "umbrella"))
+        elif 30 <= rain_chance < 50 and not windy:
+            items.append(("☂️", "small umbrella, just in case"))
+        if windy:
+            items.append(("💨", "too windy for an umbrella, wear a hood"))
+        if code in THUNDER_CODES:
+            items.append(("⛈️", "thunder possible, stay off open ground"))
+        if uv >= 5:
+            items += [("🕶️", "sunglasses"), ("🧴", "sun cream")]
+        elif uv >= 3 and feel >= 18:
+            items.append(("🕶️", "sunglasses"))
+        if not any(emoji in ("👢", "🥾") for emoji, _ in items):
+            items.append(("👟", "comfy trainers"))
+        return items
+
+    # ── 2. Jogging route ────────────────────────────────────────────────────
+
+    def _jog(self, call: Call) -> Result:
+        start = (call.inputs.get("start") or "").strip()
+        if not start:
+            error = MissingPlace("no starting point")
+            error.user_message = "Tell me where you are starting from, for example: a 5 km jog from Imperial College."
+            raise error
+        distance = call.inputs.get("distance_km")
+        target = float(distance) if distance not in (None, "") else 5.0
+        if not 1.0 <= target <= 42.2:
+            raise BadDistance(f"distance {target} out of range")
+
+        lat, lon, name = self._locate(start)
+        here = (lat, lon)
+
+        options = []
+        for park, plat, plon, lap, sight in PARKS:
+            radius = lap / (2 * math.pi)
+            straight = _km_between(here, (plat, plon))
+            out = max(0.0, straight * STREET_FACTOR - radius)
+            inside = target - 2 * out
+            if inside < 0.5:
+                continue  # too far to get there and back
+            laps = inside / lap
+            # About one lap is nicest, and less of the run on streets is better.
+            score = 0.6 * abs(laps - 1.0) + 2 * out / target + (0.5 if laps > 3 else 0.0)
+            options.append((score, park, out, inside, laps, sight))
+        options.sort()
+
+        nearest = min(PARKS, key=lambda p: _km_between(here, (p[1], p[2])))
+        nearest_km = _km_between(here, (nearest[1], nearest[2])) * STREET_FACTOR
+        if nearest_km > 20:
+            error = PlaceNotFound(f"{start!r} is {nearest_km:.0f} km from the nearest park")
+            error.user_message = f"{start} is too far out: I only know running routes in London's parks."
+            raise error
+
+        if not options:
+            half = target / 2
+            route = (f"No park is close enough for {target:g} km there and back. Run {half:.1f} km "
+                     f"out along the streets and turn round. The nearest park, {nearest[0]}, "
+                     f"is about {nearest_km:.1f} km away.")
+            data = {"start": name, "distance_km": round(target, 1), "park": "",
+                    "route": route, "total_km": round(target, 1)}
+            return Result(data=data, narrative=f"Jogging route from {name}: {route}")
+
+        best = options[0]
+        route = self._describe_run(name, *best[1:])
+        data = {
+            "start": name,
+            "distance_km": round(target, 1),
+            "park": best[1],
+            "route": route,
+            "total_km": round(2 * best[2] + best[3], 1),
+        }
+        others = [f"{o[1]} ({o[2]:.1f} km away, then {o[3]:.1f} km inside)" for o in options[1:3]]
+        if others:
+            data["other_parks"] = "; ".join(others)
+        return Result(data=data, narrative=f"🏃 {target:g} km jogging route from {name}: {route}")
+
+    @staticmethod
+    def _describe_run(start, park, out, inside, laps, sight) -> str:
+        if laps < 0.8:
+            loop = f"run about {inside:.1f} km inside, part of a lap, past {sight}"
+        elif laps <= 1.3:
+            loop = f"run one lap of about {inside:.1f} km, past {sight}"
+        else:
+            loop = f"run about {inside:.1f} km inside, roughly {laps:.1f} laps, past {sight}"
+        if out < 0.2:
+            return (f"🌳 You're right by {park}: {loop}, and finish where you started. "
+                    "Distances are estimates.")
+        return (f"🏃 Head to {park} (about {out:.1f} km), {loop}, then the same "
+                f"{out:.1f} km back to {start}. Distances are estimates.")
+
+    # ── 3. Journey and strikes ──────────────────────────────────────────────
+
+    def _journey(self, call: Call) -> Result:
+        origin = (call.inputs.get("origin") or "").strip()
+        destination = (call.inputs.get("destination") or "").strip()
+        if not origin or not destination:
+            raise MissingPlace("origin or destination missing")
+
+        a_lat, a_lon, a_name = self._locate(origin, timeout=3.0)
+        # Nominatim asks for no more than one request a second.
+        self._sleep(1.0)
+        b_lat, b_lon, b_name = self._locate(destination, timeout=3.0)
+
+        now = call.context.now.astimezone(LONDON)
+        query = urlencode({"date": now.strftime("%Y%m%d"), "time": now.strftime("%H%M"),
+                           "timeIs": "Departing"})
+        url = (f"https://api.tfl.gov.uk/Journey/JourneyResults/"
+               f"{quote(f'{a_lat:.5f},{a_lon:.5f}', safe=',')}/to/"
+               f"{quote(f'{b_lat:.5f},{b_lon:.5f}', safe=',')}?{query}")
+        try:
+            plan = self._get_json(url, "TfL journey planner", 6.0)
+        except ServiceDown as exc:
+            if " returned 404" in str(exc) or " returned 400" in str(exc):
+                raise NoJourney(f"tfl found no journey {origin!r} -> {destination!r}")
+            raise
+        journeys = (plan or {}).get("journeys") or []
+        if not journeys:
+            raise NoJourney(f"tfl returned no journeys {origin!r} -> {destination!r}")
+
+        summaries, lines_per_journey = [], []
+        for journey in journeys[:3]:
+            text, lines = self._describe_journey(journey)
+            summaries.append(text)
+            lines_per_journey.append(lines)
+
+        all_lines: list[str] = []
+        for lines in lines_per_journey:
+            for line in lines:
+                if line not in all_lines:
+                    all_lines.append(line)
+
+        problems = self._line_problems(all_lines)
+        best_lines = set(lines_per_journey[0])
+        affected = any(line in best_lines for line in problems)
+        strikes = self._strikes_elsewhere(set(all_lines))
+
+        if problems:
+            line_problems = " | ".join(f"⚠️ {text}" for text in problems.values())
+        else:
+            line_problems = "✅ No strikes or delays reported on the lines these routes use."
+
+        data = {
+            "origin": a_name,
+            "destination": b_name,
+            "best_route": summaries[0],
+            "best_route_minutes": int(journeys[0].get("duration") or 0),
+            "best_route_affected": affected,
+            "line_problems": line_problems,
+        }
+        if len(summaries) > 1:
+            data["other_routes"] = " || ".join(summaries[1:])
+        fare = (journeys[0].get("fare") or {}).get("totalCost")
+        if isinstance(fare, (int, float)) and fare > 0:
+            data["fare"] = f"£{fare / 100:.2f}"
+        if strikes:
+            data["strikes_elsewhere"] = strikes
+
+        if problems:
+            hit = ", ".join(text.split(":", 1)[0] for text in problems.values())
+            news = f"⚠️ Problems on: {hit}." + (" Your best route is affected." if affected else "")
+        else:
+            news = "✅ No strikes or delays on these lines."
+        narrative = f"🚇 {a_name} to {b_name}: {summaries[0]}. {news}"
+        return Result(data=data, narrative=narrative)
+
+    @staticmethod
+    def _describe_journey(journey: dict) -> tuple[str, list[str]]:
+        steps, lines = [], []
+        for leg in journey.get("legs") or []:
+            mode = ((leg.get("mode") or {}).get("id") or "").lower()
+            minutes = leg.get("duration") or 0
+            summary = ((leg.get("instruction") or {}).get("summary") or "").strip()
+            if mode == "walking":
+                steps.append(f"🚶 walk {minutes} min")
+                continue
+            emoji = {"tube": "🚇", "bus": "🚌", "dlr": "🚈", "overground": "🚆",
+                     "elizabeth-line": "🚆", "national-rail": "🚆", "tram": "🚊",
+                     "river-bus": "⛴️", "cable-car": "🚡"}.get(mode, "🚆")
+            steps.append(f"{emoji} {summary or mode} ({minutes} min)")
+            for option in leg.get("routeOptions") or []:
+                line = ((option.get("lineIdentifier") or {}).get("id") or "").strip()
+                if line and line not in lines:
+                    lines.append(line)
+        total = journey.get("duration") or 0
+        return f"{total} min: " + " → ".join(steps), lines
+
+    def _line_problems(self, lines: list[str]) -> dict[str, str]:
+        """line id -> what is wrong with it, for every line not running normally."""
+        if not lines:
+            return {}
+        url = "https://api.tfl.gov.uk/Line/" + quote(",".join(lines[:20]), safe=",") + "/Status"
+        try:
+            statuses = self._get_json(url, "TfL line status", 3.0)
+        except (ServiceDown, ServiceBusy):
+            return {"status": "Could not check live line status just now."}
+        return self._problems_from(statuses, lambda line_id: True)
+
+    def _strikes_elsewhere(self, on_route: set[str]) -> str:
+        """Strike notices on the tube and rail network, beyond the lines on the route."""
+        url = "https://api.tfl.gov.uk/Line/Mode/tube,elizabeth-line,overground,dlr/Status"
+        try:
+            statuses = self._get_json(url, "TfL line status", 3.0)
+        except (ServiceDown, ServiceBusy):
+            return ""
+        problems = self._problems_from(statuses, lambda line_id: line_id not in on_route,
+                                       strikes_only=True)
+        return " | ".join(f"🪧 {text}" for text in problems.values())
+
+    @staticmethod
+    def _problems_from(statuses, keep, strikes_only: bool = False) -> dict[str, str]:
+        problems: dict[str, str] = {}
+        if not isinstance(statuses, list):
+            return problems
+        for line in statuses:
+            line_id = line.get("id") or ""
+            if not keep(line_id):
+                continue
+            name = line.get("name") or line_id
+            # TfL starts most reasons with "District Line: ...", which we already say.
+            prefix = re.compile(r"^\s*" + re.escape(name) + r"(\s+line)?\s*:\s*", re.I)
+            seen, parts = set(), []
+            for status in line.get("lineStatuses") or []:
+                if status.get("statusSeverity") == 10:  # Good Service
+                    continue
+                reason = prefix.sub("", " ".join((status.get("reason") or "").split()))
+                label = status.get("statusSeverityDescription") or "Disruption"
+                if strikes_only and "strike" not in reason.lower():
+                    continue
+                if reason in seen:
+                    continue
+                seen.add(reason)
+                if len(reason) > 200:
+                    reason = reason[:197].rsplit(" ", 1)[0] + "..."
+                parts.append(f"{label}: {reason}" if reason else label)
+            if parts:
+                problems[line_id] = f"{name}: " + " / ".join(parts)
+        return problems
