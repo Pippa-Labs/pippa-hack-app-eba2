@@ -12,11 +12,11 @@ app_author_name: "Local Ravens"
 app:
   id: hack.app_eba2
   name: London Local
-  version: 0.1.0
+  version: 0.2.0
   # Never use the word "by" here: the badge is split on it.
   summary: >-
-    London helper: emoji outfits for the weather, park jogging routes, and
-    tube journeys with live strike news. Uses Open-Meteo,
+    London helper: emoji weather outfits, park jog routes, tube strikes,
+    finding saved spots and on-this-date throwbacks. Uses Open-Meteo,
     OpenStreetMap and TfL; sends only the place names you give.
 
 agent_types:
@@ -185,3 +185,100 @@ outcomes:
         type: string
         required: false
         description: Strike notices on other tube and rail lines.
+
+  # ── 4. Find a saved spot ──────────────────────────────────────────────────
+  - id: london.find_spot
+    summary: Find a saved or remembered spot in London or the UK, with its address and directions
+    example_phrases:
+      - where is that place with the
+      - find that spot i saw on instagram
+      - directions to that cafe
+      - how far is that place from
+      - the ramen place near london bridge
+      - where was that rooftop bar
+      - address of the spot i saved
+      - that restaurant with the glass dome
+    inputs:
+      - name: spot
+        type: string
+        required: false
+        description: >-
+          The place's name or location tag, if the message has one, for
+          example "Sky Garden". Ignore links and URLs entirely. If no name is
+          given, return an empty string rather than guessing.
+      - name: description
+        type: string
+        required: false
+        description: >-
+          What the person remembers about the place, in their words, for
+          example "ramen near London Bridge", "rooftop bar" or "glass dome".
+          Keep any "near ..." part. If there is none, return an empty string.
+      - name: start
+        type: string
+        required: false
+        description: >-
+          Where they would set off from, if they said, for example "King's
+          Cross". If they did not say, return an empty string rather than
+          guessing.
+    output:
+      - name: name
+        type: string
+      - name: type
+        type: string
+      - name: area
+        type: string
+      - name: address
+        type: string
+      - name: directions_url
+        type: string
+        description: A Google Maps link with public transport directions.
+      - name: source
+        type: string
+        description: '"saved" (from their saved spots), "lookup" (found by name) or "description".'
+      - name: other_matches
+        type: array
+        item_type: string
+        description: Other places that could be the one they mean.
+      - name: distance_km
+        type: number
+        required: false
+        description: Straight-line distance from the starting point.
+      - name: walk_minutes
+        type: integer
+        required: false
+      - name: transit_minutes
+        type: integer
+        required: false
+        description: Quickest public transport time, from TfL (London only).
+      - name: start_resolved
+        type: string
+        required: false
+        description: The starting point as it was found on the map.
+
+  # ── 5. On this date ───────────────────────────────────────────────────────
+  - id: london.on_this_day
+    summary: Throwback to saved spots that were posted on this date in earlier years
+    example_phrases:
+      - on this day
+      - spots posted on this date
+      - a year ago on this date
+      - throwback to places from this date
+      - what places were posted on this day in past years
+      - anniversary of spots i saved
+      - memories from this date
+    inputs: []
+    output:
+      - name: date_checked
+        type: string
+      - name: spots
+        type: array
+        item_type: string
+        description: Spots posted on this date in earlier years, newest first.
+      - name: years_ago
+        type: array
+        item_type: integer
+        description: How many years ago each of those spots was posted.
+      - name: nearest_other_date
+        type: string
+        required: false
+        description: If none match, the saved spot posted nearest to this date.

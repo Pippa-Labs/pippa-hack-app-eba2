@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 import pytest
 from pippa_agentapp_sdk import LocalRunner, RateLimitedError, ServiceUnavailableError
 
-from app import App, BadDistance, CannotReadDay, MissingPlace, NoJourney, PlaceNotFound
+from app import (App, BadDistance, CannotReadDay, MissingPlace, NoJourney, PlaceNotFound,
+                 SpotNotFound)
 
 # Friday 20 November 2026, 10:00 in London (GMT, so the same as UTC).
 NOW = datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc)
@@ -144,7 +145,8 @@ def test_the_manifest_is_valid():
     app = App()
     assert app.manifest.app_id == "hack.app_eba2"
     assert [o.id for o in app.manifest.outcomes] == [
-        "london.outfit", "london.jog", "london.journey"]
+        "london.outfit", "london.jog", "london.journey",
+        "london.find_spot", "london.on_this_day"]
 
 
 # ── 1. What to wear ─────────────────────────────────────────────────────────
@@ -306,3 +308,103 @@ def test_picked_by_name_it_answers_the_same():
     inputs = {"origin": "Imperial College", "destination": "Ealing Broadway"}
     picked = run(journey_app(), "london.journey", inputs, explicit=True)
     assert picked.data == run(journey_app(), "london.journey", inputs).data
+
+
+# ── 4. Find a saved spot ────────────────────────────────────────────────────
+
+SAVED = [
+    {"name": "Sky Garden", "type": "viewpoint", "area": "City of London",
+     "address": "1 Sky Garden Walk, EC3M 8AF", "lat": 51.5111, "lon": -0.0835,
+     "tags": ["rooftop", "glass dome", "views"], "posted_on": "2024-11-20"},
+    {"name": "Kanada-Ya", "type": "ramen restaurant", "area": "Covent Garden",
+     "address": "64 St Giles High Street, WC2H 8LE", "lat": 51.5155, "lon": -0.1270,
+     "tags": ["ramen", "noodles"], "posted_on": "2023-11-18"},
+]
+
+KINGS_CROSS = [{"lat": "51.5308", "lon": "-0.1238", "name": "King's Cross",
+                "type": "station", "display_name": "King's Cross, London, United Kingdom",
+                "address": {"suburb": "King's Cross"}}]
+
+
+def spot_app(routes: dict, spots=SAVED) -> App:
+    app = app_with(routes)
+    app._spots = spots
+    return app
+
+
+def test_a_saved_spot_is_found_by_name():
+    data = run(spot_app({}), "london.find_spot", {"spot": "Sky Garden"}).data
+    assert data["name"] == "Sky Garden" and data["source"] == "saved"
+    assert "travelmode=transit" in data["directions_url"]
+
+
+def test_a_saved_spot_is_found_by_description():
+    data = run(spot_app({}), "london.find_spot", {"description": "that glass dome rooftop"}).data
+    assert data["name"] == "Sky Garden"
+
+
+def test_an_unsaved_name_is_looked_up():
+    reply = [{"lat": "51.5081", "lon": "-0.0759", "name": "Tower of London",
+              "type": "castle", "display_name": "Tower of London, Tower Hill, London, United Kingdom",
+              "address": {"suburb": "Tower Hill"}}]
+    data = run(spot_app({"nominatim": reply}), "london.find_spot",
+               {"spot": "Tower of London"}).data
+    assert data["source"] == "lookup" and data["area"] == "Tower Hill"
+
+
+def test_a_description_finds_nearby_candidates():
+    area = [{"lat": "51.5055", "lon": "-0.0860", "name": "London Bridge",
+             "display_name": "London Bridge, London, United Kingdom", "address": {}}]
+    overpass = {"elements": [
+        {"type": "node", "lat": 51.5040, "lon": -0.0870,
+         "tags": {"name": "Hakata Ramen", "cuisine": "ramen", "addr:street": "Bermondsey Street"}},
+        {"type": "way", "center": {"lat": 51.5070, "lon": -0.0900},
+         "tags": {"name": "Tonkotsu Bankside", "cuisine": "ramen"}},
+    ]}
+    data = run(spot_app({"nominatim": area, "overpass-api": overpass}, spots=[]),
+               "london.find_spot", {"description": "ramen near London Bridge"}).data
+    assert data["source"] == "description"
+    assert data["name"] == "Hakata Ramen"
+    assert any("Tonkotsu" in other for other in data["other_matches"])
+
+
+def test_only_a_link_is_refused_and_never_fetched():
+    with pytest.raises(SpotNotFound) as failure:
+        run(spot_app({}), "london.find_spot",
+            {"spot": "https://www.instagram.com/p/abc123/", "description": ""})
+    assert "Instagram links" in failure.value.user_message
+
+
+def test_a_routing_timeout_still_returns_the_spot():
+    data = run(spot_app({"nominatim": KINGS_CROSS,
+                         "Journey/JourneyResults": TimeoutError("slow")}),
+               "london.find_spot", {"spot": "Sky Garden", "start": "King's Cross"}).data
+    assert data["name"] == "Sky Garden"
+    assert data["start_resolved"] == "King's Cross"
+    assert data["distance_km"] > 3 and data["walk_minutes"] > 30
+    assert "transit_minutes" not in data
+
+
+def test_a_start_adds_transit_minutes():
+    data = run(spot_app({"nominatim": KINGS_CROSS,
+                         "Journey/JourneyResults": {"journeys": [{"duration": 24}, {"duration": 31}]}}),
+               "london.find_spot", {"spot": "Sky Garden", "start": "King's Cross"},
+               explicit=True).data
+    assert data["transit_minutes"] == 24
+    assert "origin=" in data["directions_url"]
+
+
+# ── 5. On this date ─────────────────────────────────────────────────────────
+
+
+def test_spots_from_this_date_in_earlier_years():
+    data = run(spot_app({}), "london.on_this_day", {}).data
+    assert data["date_checked"] == "20 November"
+    assert data["spots"] == ["Sky Garden (viewpoint, City of London), 2024"]
+    assert data["years_ago"] == [2]
+
+
+def test_no_spot_on_this_date_gives_the_nearest():
+    data = run(spot_app({}, spots=SAVED[1:]), "london.on_this_day", {}).data
+    assert data["spots"] == [] and data["years_ago"] == []
+    assert data["nearest_other_date"].startswith("18 November 2023: Kanada-Ya")

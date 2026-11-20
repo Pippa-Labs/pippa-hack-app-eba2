@@ -3,11 +3,17 @@
     london.outfit   what to wear for the weather, drawn as an emoji avatar
     london.jog      a jogging route out to a park and back, for a distance
     london.journey  how to get from A to B, and which strikes or delays hit it
+    london.find_spot    find a saved (or described) spot, and how far it is
+    london.on_this_day  saved spots posted on this date in earlier years
+
+Saved spots live in spots.json beside this file: place facts only (name,
+type, area, public address, coordinates, a few tags, the date posted).
 
 Data sources, all free and keyless:
     Open-Meteo        weather forecast
     Nominatim (OSM)   turning a place name into coordinates
     TfL Unified API   journey planner and live line status
+    Overpass (OSM)    places of a type near an area, for described spots
 
 Every request goes through `_fetch`, so the tests can replace it.
 """
@@ -37,6 +43,7 @@ from pippa_agentapp_sdk import (
 )
 
 MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
+SPOTS_PATH = Path(__file__).with_name("spots.json")
 LONDON = ZoneInfo("Europe/London")
 
 #: Nominatim answers 403 without a descriptive User-Agent.
@@ -76,6 +83,12 @@ class BadDistance(AgentAppError):
 
 class NoJourney(AgentAppError):
     user_message = "TfL could not find a public transport route between those two places."
+    retryable = False
+
+
+class SpotNotFound(AgentAppError):
+    user_message = ("I can't open Instagram links. Tell me the place name, or describe "
+                    "it: what it is and roughly where.")
     retryable = False
 
 
@@ -152,11 +165,281 @@ def _pretty_day(day: date) -> str:
     return f"{day.strftime('%A')} {day.day} {day.strftime('%B')}"
 
 
-class App:
+# ── 4 & 5. Saved spots ──────────────────────────────────────────────────────
+
+LINK = re.compile(r"(https?://\S+|www\.\S+|\S*instagr(?:am\.com|\.am)\S*)", re.I)
+SPOT_STOPWORDS = {
+    "the", "a", "an", "that", "this", "place", "spot", "with", "and", "of", "in",
+    "near", "at", "by", "around", "to", "for", "on", "i", "saw", "where", "is", "was",
+    "one", "some", "my", "it", "there", "next", "close",
+}
+AREA = re.compile(r"\b(?:near|in|around|by|at|next to|close to)\s+(.+)$", re.I)
+# Words in a description -> (word, OSM key, OSM value, what to call it).
+PLACE_TYPES = [
+    ("rooftop", "amenity", "bar", "rooftop bar"),
+    ("ramen", "cuisine", "ramen", "ramen restaurant"),
+    ("sushi", "cuisine", "sushi", "sushi restaurant"),
+    ("pizza", "cuisine", "pizza", "pizza place"),
+    ("dim sum", "cuisine", "dim_sum", "dim sum restaurant"),
+    ("coffee", "amenity", "cafe", "cafe"),
+    ("cafe", "amenity", "cafe", "cafe"),
+    ("brunch", "amenity", "cafe", "cafe"),
+    ("bakery", "shop", "bakery", "bakery"),
+    ("pub", "amenity", "pub", "pub"),
+    ("bar", "amenity", "bar", "bar"),
+    ("restaurant", "amenity", "restaurant", "restaurant"),
+    ("museum", "tourism", "museum", "museum"),
+    ("gallery", "tourism", "gallery", "gallery"),
+    ("viewpoint", "tourism", "viewpoint", "viewpoint"),
+    ("view", "tourism", "viewpoint", "viewpoint"),
+    ("market", "amenity", "marketplace", "market"),
+    ("garden", "leisure", "garden", "garden"),
+    ("park", "leisure", "park", "park"),
+    ("bookshop", "shop", "books", "bookshop"),
+]
+WALK_KMH = 5.0
+SPOT_BUDGET_S = 13.0  # stop adding extras after this, inside the 20 s limit
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9']+", text.lower()) if w not in SPOT_STOPWORDS}
+
+
+def _maps_link(destination: str, origin: str = "") -> str:
+    params = {"api": "1", "destination": destination, "travelmode": "transit"}
+    if origin:
+        params["origin"] = origin
+    return "https://www.google.com/maps/dir/?" + urlencode(params)
+
+
+def _spot_line(spot: dict) -> str:
+    bits = ", ".join(b for b in (spot.get("type"), spot.get("area")) if b)
+    return f"{spot['name']} ({bits})" if bits else spot["name"]
+
+
+def _latlon(place: dict) -> str:
+    return f"{place['lat']:.5f},{place['lon']:.5f}"
+
+
+class SpotsMixin:
+    """find_spot and on_this_day. Mixed into App below."""
+
+    def _find_spot(self, call: Call) -> Result:
+        started = self._clock()
+        spot_text = LINK.sub(" ", call.inputs.get("spot") or "").strip()
+        description = LINK.sub(" ", call.inputs.get("description") or "").strip()
+        start = LINK.sub(" ", call.inputs.get("start") or "").strip()
+        self._nominatim_calls = 0
+
+        others: list[str] = []
+        saved = self._saved_match(spot_text, description)
+        if saved:
+            found, source = saved[0], "saved"
+            others = [_spot_line(s) for s in saved[1:4]]
+        elif spot_text:
+            found, source = self._geocode(spot_text, 4.0), "lookup"
+        elif description:
+            candidates = self._search_described(description)
+            found, source = candidates[0], "description"
+            others = [_spot_line(c) for c in candidates[1:3]]
+        else:
+            raise SpotNotFound("no usable spot name or description")
+
+        has_coords = found.get("lat") is not None and found.get("lon") is not None
+        data = {
+            "name": found["name"],
+            "type": found.get("type") or "",
+            "area": found.get("area") or "",
+            "address": found.get("address") or "",
+            "source": source,
+            "other_matches": others,
+        }
+
+        origin = None
+        if start and has_coords and self._clock() - started < SPOT_BUDGET_S:
+            try:
+                origin = self._geocode(start, 3.0)
+            except AgentAppError:
+                origin = None  # the spot is still worth returning
+        if origin:
+            km = _km_between((origin["lat"], origin["lon"]), (found["lat"], found["lon"]))
+            data["start_resolved"] = origin["name"]
+            data["distance_km"] = round(km, 1)
+            data["walk_minutes"] = max(1, round(km * STREET_FACTOR / WALK_KMH * 60))
+            if self._clock() - started < SPOT_BUDGET_S:
+                minutes = self._transit_minutes(origin, found, call.context.now)
+                if minutes is not None:
+                    data["transit_minutes"] = minutes
+
+        destination = (_latlon(found) if has_coords
+                       else f"{found['name']} {data['address']}".strip())
+        data["directions_url"] = _maps_link(destination, _latlon(origin) if origin else "")
+
+        narrative = f"📍 {_spot_line(found)}"
+        if data["address"]:
+            narrative += f", {data['address']}"
+        if "distance_km" in data:
+            narrative += f". About {data['distance_km']} km from {origin['name']}"
+            if "transit_minutes" in data:
+                narrative += f", {data['transit_minutes']} min on public transport"
+            narrative += f", or about a {data['walk_minutes']} min walk"
+        return Result(data=data, narrative=narrative + ".")
+
+    def _saved_match(self, spot_text: str, description: str) -> list[dict]:
+        """Saved spots that match, best first. A name match beats a tag match."""
+        wanted = _words(f"{spot_text} {description}")
+        if not wanted:
+            return []
+        scored = []
+        for spot in self._spots:
+            haystack = _words(" ".join([spot.get("name", ""), spot.get("type", ""),
+                                        spot.get("area", ""), " ".join(spot.get("tags", []))]))
+            score = len(wanted & haystack)
+            if spot_text and spot_text.lower() in spot.get("name", "").lower():
+                score += 5
+            if score:
+                scored.append((score, spot))
+        if not scored:
+            return []
+        # A single shared word ("bar") is not enough when the person said more.
+        if max(score for score, _ in scored) < 2 and len(wanted) > 1:
+            return []
+        scored.sort(key=lambda pair: -pair[0])
+        return [spot for _, spot in scored]
+
+    def _nominatim(self, query: dict, timeout: float):
+        # Nominatim asks for no more than one request a second.
+        if self._nominatim_calls:
+            self._sleep(1.0)
+        self._nominatim_calls += 1
+        return self._get_json("https://nominatim.openstreetmap.org/search?" + urlencode(query),
+                              "Nominatim", timeout)
+
+    def _geocode(self, place: str, timeout: float) -> dict:
+        """A UK place name -> a spot-shaped dict."""
+        results = self._nominatim({"q": place, "format": "jsonv2", "limit": 1,
+                                   "countrycodes": "gb", "addressdetails": 1}, timeout)
+        if not isinstance(results, list) or not results:
+            error = PlaceNotFound(f"nominatim found nothing for {place!r}")
+            error.user_message = f"I could not find {place} in the UK."
+            raise error
+        first = results[0]
+        try:
+            lat, lon = float(first["lat"]), float(first["lon"])
+        except (KeyError, TypeError, ValueError):
+            raise ServiceDown("nominatim result had no coordinates")
+        address = first.get("address") or {}
+        name = (first.get("name") or "").strip() or place
+        parts = [p.strip() for p in (first.get("display_name") or "").split(",") if p.strip()]
+        if parts and parts[0] == name:
+            parts = parts[1:]
+        return {
+            "name": name,
+            "type": (first.get("type") or "").replace("_", " "),
+            "area": (address.get("suburb") or address.get("city_district")
+                     or address.get("town") or address.get("city") or ""),
+            "address": ", ".join(p for p in parts if p != "United Kingdom")[:120],
+            "lat": lat, "lon": lon,
+        }
+
+    def _search_described(self, description: str) -> list[dict]:
+        """'ramen near London Bridge' -> up to 3 nearby places from OpenStreetMap."""
+        lowered = description.lower()
+        kind = next((t for t in PLACE_TYPES if re.search(rf"\b{t[0]}", lowered)), None)
+        area_match = AREA.search(description)
+        if not kind or not area_match:
+            error = SpotNotFound(f"cannot search for {description!r}")
+            if kind:
+                error.user_message = (f"Roughly where is the {kind[3]}? "
+                                      "For example \"near London Bridge\".")
+            raise error
+        area = self._geocode(area_match.group(1).strip(" .?!"), 4.0)
+        word, key, value, label = kind
+        query = (f'[out:json][timeout:6];nwr["{key}"="{value}"]["name"]'
+                 f'(around:900,{_latlon(area)});out center 25;')
+        reply = self._get_json(
+            "https://overpass-api.de/api/interpreter?" + urlencode({"data": query}),
+            "OpenStreetMap", 7.0)
+        found = []
+        for element in (reply or {}).get("elements", []):
+            tags = element.get("tags") or {}
+            centre = element.get("center") or {}
+            lat, lon = element.get("lat", centre.get("lat")), element.get("lon", centre.get("lon"))
+            if not tags.get("name") or lat is None or lon is None:
+                continue
+            street = " ".join(b for b in (tags.get("addr:housenumber"), tags.get("addr:street")) if b)
+            # OSM rarely tags rooftops: keep every bar, but put roof ones first.
+            roof_last = 0 if word != "rooftop" or "roof" in json.dumps(tags).lower() else 1
+            found.append((roof_last, _km_between((area["lat"], area["lon"]), (lat, lon)), {
+                "name": tags["name"], "type": label, "area": area["name"],
+                "address": ", ".join(b for b in (street, tags.get("addr:postcode")) if b),
+                "lat": lat, "lon": lon}))
+        if not found:
+            error = SpotNotFound(f"overpass found no {value} near {area['name']!r}")
+            error.user_message = (f"I couldn't find a {label} near {area['name']}. "
+                                  "Do you remember its name?")
+            raise error
+        found.sort(key=lambda item: (item[0], item[1]))
+        return [spot for _, _, spot in found[:3]]
+
+    def _transit_minutes(self, origin: dict, spot: dict, now: datetime):
+        """Quickest TfL journey in minutes, or None (outside London, or TfL failed)."""
+        local = now.astimezone(LONDON)
+        query = urlencode({"date": local.strftime("%Y%m%d"), "time": local.strftime("%H%M"),
+                           "timeIs": "Departing"})
+        url = (f"https://api.tfl.gov.uk/Journey/JourneyResults/"
+               f"{quote(_latlon(origin), safe=',')}/to/{quote(_latlon(spot), safe=',')}?{query}")
+        try:
+            plan = self._get_json(url, "TfL journey planner", 4.0)
+        except AgentAppError:
+            return None
+        durations = [j.get("duration") for j in (plan or {}).get("journeys") or []
+                     if isinstance(j.get("duration"), int)]
+        return min(durations) if durations else None
+
+    def _on_this_day(self, call: Call) -> Result:
+        today = call.context.now.astimezone(LONDON).date()
+        dated = []
+        for spot in self._spots:
+            try:
+                dated.append((date.fromisoformat(spot["posted_on"]), spot))
+            except (KeyError, TypeError, ValueError):
+                continue
+        hits = sorted(((d, s) for d, s in dated
+                       if (d.month, d.day) == (today.month, today.day) and d.year < today.year),
+                      key=lambda pair: pair[0], reverse=True)
+        data = {
+            "date_checked": f"{today.day} {today:%B}",
+            "spots": [f"{_spot_line(s)}, {d.year}" for d, s in hits],
+            "years_ago": [today.year - d.year for d, _ in hits],
+        }
+        if hits:
+            return Result(data=data,
+                          narrative="📅 On this date: " + "; ".join(data["spots"]) + ".")
+
+        def gap(d: date) -> int:
+            day = 28 if (d.month, d.day) == (2, 29) else d.day
+            days = abs((date(today.year, d.month, day) - today).days)
+            return min(days, 365 - days)
+
+        earlier = [(gap(d), -d.toordinal(), d, s) for d, s in dated if d < today]
+        if earlier:
+            _, _, d, s = min(earlier, key=lambda item: (item[0], item[1]))
+            data["nearest_other_date"] = f"{d.day} {d:%B} {d.year}: {_spot_line(s)}"
+            narrative = (f"Nothing was posted on {data['date_checked']} in earlier years; "
+                         f"the nearest is {data['nearest_other_date']}.")
+        else:
+            narrative = "There are no saved spots yet."
+        return Result(data=data, narrative=narrative)
+
+
+class App(SpotsMixin):
     def __init__(self) -> None:
         self._manifest = validate_manifest(load_manifest_file(MANIFEST_PATH))
         # Replaced in tests so they never wait.
         self._sleep = time.sleep
+        self._clock = time.monotonic
+        self._spots = json.loads(SPOTS_PATH.read_text("utf-8"))
 
     @property
     def manifest(self) -> Manifest:
@@ -169,6 +452,10 @@ class App:
             return self._jog(call)
         if call.outcome_id == "london.journey":
             return self._journey(call)
+        if call.outcome_id == "london.find_spot":
+            return self._find_spot(call)
+        if call.outcome_id == "london.on_this_day":
+            return self._on_this_day(call)
         raise AgentAppError(f"this app cannot do {call.outcome_id!r}")
 
     # ── Network ─────────────────────────────────────────────────────────────
