@@ -278,12 +278,15 @@ def test_a_strike_on_the_best_route_is_reported():
     # Strikes on other lines are mentioned; plain delays elsewhere are not.
     assert "Piccadilly" in data["strikes_elsewhere"]
     assert "Jubilee" not in data["strikes_elsewhere"]
+    # The best route uses the struck District line, so the Central one is offered.
+    assert "Central line" in data["strike_free_route"]
 
 
 def test_good_service_is_said_plainly():
     data = run(journey_app(route_status=GOOD_STATUS), "london.journey",
                {"origin": "Imperial College", "destination": "Ealing Broadway"}).data
     assert data["best_route_affected"] is False
+    assert "strike_free_route" not in data
     assert data["line_problems"].startswith("✅")
 
 
@@ -394,17 +397,48 @@ def test_a_start_adds_transit_minutes():
     assert "origin=" in data["directions_url"]
 
 
-# ── 5. On this date ─────────────────────────────────────────────────────────
+# ── 5. On this day in London history ────────────────────────────────────
+
+EVENTS = {"events": [
+    {"year": 1947, "text": "Princess Elizabeth marries Philip Mountbatten at Westminster Abbey.",
+     "pages": [{"title": "Westminster Abbey"}]},
+    {"year": 1989, "text": "The Convention on the Rights of the Child is adopted in New York.",
+     "pages": []},
+    {"year": 1992, "text": "A fire severely damages Windsor Castle.",
+     "pages": [{"title": "Windsor Castle", "description": "Royal residence in Berkshire"}]},
+]}
+TOWER_SEARCH = {"pages": [{"key": "Tower_of_London", "title": "Tower of London"}]}
+TOWER_SUMMARY = {"title": "Tower of London", "extract":
+                 "The Tower of London is a historic castle on the north bank of the Thames. "
+                 "It was founded in 1066 as part of the Norman Conquest."}
 
 
-def test_spots_from_this_date_in_earlier_years():
-    data = run(spot_app({}), "london.on_this_day", {}).data
+def history_app(spots=SAVED, events=EVENTS, **routes) -> App:
+    return spot_app({"onthisday": events, **routes}, spots=spots)
+
+
+def test_london_events_on_this_date():
+    data = run(history_app(), "london.on_this_day", {}).data
     assert data["date_checked"] == "20 November"
+    assert data["london_history"] == [
+        "1947: Princess Elizabeth marries Philip Mountbatten at Westminster Abbey."]
     assert data["spots"] == ["Sky Garden (viewpoint, City of London), 2024"]
     assert data["years_ago"] == [2]
 
 
+def test_a_named_place_gets_its_story():
+    data = run(history_app(**{"search/title": TOWER_SEARCH, "page/summary": TOWER_SUMMARY}),
+               "london.on_this_day", {"place": "Tower of London"}, explicit=True).data
+    assert data["place_history"].startswith("Tower of London: The Tower of London is")
+    assert "1066" in data["place_history"]
+
+
 def test_no_spot_on_this_date_gives_the_nearest():
-    data = run(spot_app({}, spots=SAVED[1:]), "london.on_this_day", {}).data
+    data = run(history_app(spots=SAVED[1:]), "london.on_this_day", {}).data
     assert data["spots"] == [] and data["years_ago"] == []
     assert data["nearest_other_date"].startswith("18 November 2023: Kanada-Ya")
+
+
+def test_wikipedia_down_with_nothing_else_is_retryable():
+    with pytest.raises(ServiceUnavailableError):
+        run(history_app(spots=[], events=TimeoutError("slow")), "london.on_this_day", {})

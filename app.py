@@ -4,7 +4,7 @@
     london.jog      a jogging route out to a park and back, for a distance
     london.journey  how to get from A to B, and which strikes or delays hit it
     london.find_spot    find a saved (or described) spot, and how far it is
-    london.on_this_day  saved spots posted on this date in earlier years
+    london.on_this_day  London history on this date, a place's story, saved spots
 
 Saved spots live in spots.json beside this file: place facts only (name,
 type, area, public address, coordinates, a few tags, the date posted).
@@ -14,6 +14,7 @@ Data sources, all free and keyless:
     Nominatim (OSM)   turning a place name into coordinates
     TfL Unified API   journey planner and live line status
     Overpass (OSM)    places of a type near an area, for described spots
+    Wikipedia         "on this day" events, and a short history of a place
 
 Every request goes through `_fetch`, so the tests can replace it.
 """
@@ -199,6 +200,7 @@ PLACE_TYPES = [
 ]
 WALK_KMH = 5.0
 SPOT_BUDGET_S = 13.0  # stop adding extras after this, inside the 20 s limit
+LONDON_WORDS = ("london", "westminster", "thames", "buckingham palace", "tower bridge")
 
 
 def _words(text: str) -> set[str]:
@@ -398,7 +400,16 @@ class SpotsMixin:
         return min(durations) if durations else None
 
     def _on_this_day(self, call: Call) -> Result:
+        started = self._clock()
         today = call.context.now.astimezone(LONDON).date()
+        place = LINK.sub(" ", call.inputs.get("place") or "").strip()
+
+        history_error = None
+        try:
+            history = self._london_history(today, place)
+        except AgentAppError as exc:
+            history, history_error = [], exc
+
         dated = []
         for spot in self._spots:
             try:
@@ -410,12 +421,10 @@ class SpotsMixin:
                       key=lambda pair: pair[0], reverse=True)
         data = {
             "date_checked": f"{today.day} {today:%B}",
+            "london_history": history,
             "spots": [f"{_spot_line(s)}, {d.year}" for d, s in hits],
             "years_ago": [today.year - d.year for d, _ in hits],
         }
-        if hits:
-            return Result(data=data,
-                          narrative="📅 On this date: " + "; ".join(data["spots"]) + ".")
 
         def gap(d: date) -> int:
             day = 28 if (d.month, d.day) == (2, 29) else d.day
@@ -423,15 +432,70 @@ class SpotsMixin:
             return min(days, 365 - days)
 
         earlier = [(gap(d), -d.toordinal(), d, s) for d, s in dated if d < today]
-        if earlier:
+        if not hits and earlier:
             _, _, d, s = min(earlier, key=lambda item: (item[0], item[1]))
             data["nearest_other_date"] = f"{d.day} {d:%B} {d.year}: {_spot_line(s)}"
-            narrative = (f"Nothing was posted on {data['date_checked']} in earlier years; "
-                         f"the nearest is {data['nearest_other_date']}.")
-        else:
-            narrative = "There are no saved spots yet."
-        return Result(data=data, narrative=narrative)
 
+        if place and self._clock() - started < 12.0:
+            story = self._place_story(place)
+            if story:
+                data["place_history"] = story
+
+        if history_error and not history and not hits and "place_history" not in data:
+            raise history_error
+
+        parts = []
+        if "place_history" in data:
+            parts.append(f"🏰 {data['place_history']}")
+        elif place:
+            parts.append(f"I found no history page for {place}.")
+        if history:
+            parts.append(f"📜 On {data['date_checked']} in London: " + "; ".join(history[:3]) + ".")
+        elif not history_error:
+            parts.append(f"No London events are listed for {data['date_checked']}.")
+        if hits:
+            parts.append("📅 Your spots from this date: " + "; ".join(data["spots"]) + ".")
+        return Result(data=data, narrative=" ".join(parts))
+
+    def _london_history(self, day: date, place: str) -> list[str]:
+        """Wikipedia's events on this date that happened in London (or at the place)."""
+        url = f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/{day:%m}/{day:%d}"
+        reply = self._get_json(url, "Wikipedia", 5.0)
+        wanted = list(LONDON_WORDS) + ([place.lower()] if place else [])
+        found = []
+        for event in (reply or {}).get("events", []):
+            text = " ".join((event.get("text") or "").split())
+            pages = " ".join(f"{p.get('title', '')} {p.get('description', '')}"
+                             for p in event.get("pages") or [])
+            if not text or not isinstance(event.get("year"), int):
+                continue
+            if any(word in f"{text} {pages}".lower() for word in wanted):
+                found.append((event["year"], f"{event['year']}: {text[:220]}"))
+        found.sort()
+        return [line for _, line in found[:6]]
+
+    def _place_story(self, place: str) -> str:
+        """A short history of a named place, from its Wikipedia summary. '' if none."""
+        try:
+            search = self._get_json(
+                "https://en.wikipedia.org/w/rest.php/v1/search/title?"
+                + urlencode({"q": place, "limit": 1}), "Wikipedia", 4.0)
+            pages = (search or {}).get("pages") or []
+            if not pages or not pages[0].get("key"):
+                return ""
+            summary = self._get_json(
+                "https://en.wikipedia.org/api/rest_v1/page/summary/"
+                + quote(pages[0]["key"], safe=""), "Wikipedia", 4.0)
+        except AgentAppError:
+            return ""
+        extract = " ".join(((summary or {}).get("extract") or "").split())
+        if not extract:
+            return ""
+        if len(extract) > 450:
+            cut = extract[:450].rsplit(". ", 1)[0]
+            extract = cut + "." if len(cut) > 100 else extract[:450].rsplit(" ", 1)[0] + "…"
+        title = (summary or {}).get("title") or pages[0].get("title") or place
+        return f"{title}: {extract}"
 
 class App(SpotsMixin):
     def __init__(self) -> None:
@@ -797,6 +861,12 @@ class App(SpotsMixin):
         best_lines = set(lines_per_journey[0])
         affected = any(line in best_lines for line in problems)
         strikes = self._strikes_elsewhere(set(all_lines))
+        strike_free = ""
+        if affected:
+            for i, lines in enumerate(lines_per_journey[1:], start=1):
+                if not any(line in problems for line in lines):
+                    strike_free = summaries[i]
+                    break
 
         if problems:
             line_problems = " | ".join(f"⚠️ {text}" for text in problems.values())
@@ -818,12 +888,18 @@ class App(SpotsMixin):
             data["fare"] = f"£{fare / 100:.2f}"
         if strikes:
             data["strikes_elsewhere"] = strikes
+        if strike_free:
+            data["strike_free_route"] = strike_free
 
         if problems:
             hit = ", ".join(text.split(":", 1)[0] for text in problems.values())
             news = f"⚠️ Problems on: {hit}." + (" Your best route is affected." if affected else "")
         else:
             news = "✅ No strikes or delays on these lines."
+        if strike_free:
+            news += f" ✅ Avoid it: {strike_free}."
+        elif affected:
+            news += " Every suggested route uses an affected line, so allow extra time."
         narrative = f"🚇 {a_name} to {b_name}: {summaries[0]}. {news}"
         return Result(data=data, narrative=narrative)
 

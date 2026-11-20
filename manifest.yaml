@@ -1,4 +1,4 @@
-# London Local: what to wear, where to run, and how to get there.
+# London Raven: what to wear, where to run, how to get there, and what happened here.
 # See CLAUDE.md for the rules this file follows.
 
 manifest_version: 1
@@ -11,13 +11,26 @@ app_author_name: "Local Ravens"
 
 app:
   id: hack.app_eba2
-  name: London Local
-  version: 0.2.0
+  name: London Raven
+  version: 0.2.1
   # Never use the word "by" here: the badge is split on it.
+  # The chooser reads only the first sentence (about 110 characters), so it
+  # names all four; the rest is for people deciding whether to install it.
   summary: >-
-    London helper: emoji weather outfits, park jog routes, tube strikes,
-    finding saved spots and on-this-date throwbacks. Uses Open-Meteo,
-    OpenStreetMap and TfL; sends only the place names you give.
+    London weather outfits, jog routes, strike-aware tube journeys, finding
+    places and on-this-day history. 1. Weather 🌦️: London weather is famously
+    unpredictable, so ask "do I need an umbrella on Saturday?" and get an emoji
+    outfit, the temperature and when the rain starts. 2. Jogging 🏃: London is
+    full of beautiful parks to run or walk in; ask for "5km from Imperial
+    College and back" and get a route to a park near you. 3. Places and
+    transport 🚇: strikes are common in London; ask "Imperial College to Ealing
+    Broadway" and it shows the routes, which lines are hit and a way round the
+    strike. Saw somewhere interesting online? Describe it, like "ramen near
+    London Bridge", and it finds the place and how to get there. 4. On this day
+    📜: London is a playground of history; ask what happened in London on this
+    date, or for the story of a place like the Tower of London. Uses
+    Open-Meteo, OpenStreetMap, TfL and Wikipedia, and sends only the place
+    names you give.
 
 agent_types:
   - personal
@@ -132,7 +145,7 @@ outcomes:
 
   # ── 3. Journey and strikes ────────────────────────────────────────────────
   - id: london.journey
-    summary: Plan a London public transport journey from A to B and say which tube strikes or delays affect it
+    summary: Plan a London public transport journey from A to B, say which tube strikes or delays affect it, and suggest a way round them
     example_phrases:
       - how do i get from a to b
       - best way to travel from
@@ -142,6 +155,7 @@ outcomes:
       - will the strike affect my journey
       - tube from to
       - quickest way across london to
+      - how do i avoid the strike
     inputs:
       - name: origin
         type: string
@@ -185,6 +199,10 @@ outcomes:
         type: string
         required: false
         description: Strike notices on other tube and rail lines.
+      - name: strike_free_route
+        type: string
+        required: false
+        description: When the best route is hit, the quickest suggested route that avoids it.
 
   # ── 4. Find a saved spot ──────────────────────────────────────────────────
   - id: london.find_spot
@@ -255,25 +273,40 @@ outcomes:
         required: false
         description: The starting point as it was found on the map.
 
-  # ── 5. On this date ───────────────────────────────────────────────────────
+  # ── 5. On this day in London history ──────────────────────────────────
   - id: london.on_this_day
-    summary: Throwback to saved spots that were posted on this date in earlier years
+    summary: London history on this date, the story of a place, and saved spots posted on this date in earlier years
     example_phrases:
-      - on this day
-      - spots posted on this date
+      - what happened on this day in history
+      - on this day in london history
+      - history of a famous landmark
+      - historic events on this date
+      - what is the story behind
+      - throwback spots posted on this date
       - a year ago on this date
-      - throwback to places from this date
-      - what places were posted on this day in past years
-      - anniversary of spots i saved
-      - memories from this date
-    inputs: []
+    inputs:
+      - name: place
+        type: string
+        required: false
+        description: >-
+          A place whose history they asked about, for example "Tower of
+          London" or "Covent Garden". Ignore links. If they named no place,
+          return an empty string rather than guessing.
     output:
       - name: date_checked
         type: string
+      - name: london_history
+        type: array
+        item_type: string
+        description: Events in London on this date in past years, oldest first, each starting with its year.
+      - name: place_history
+        type: string
+        required: false
+        description: A short history of the place they named.
       - name: spots
         type: array
         item_type: string
-        description: Spots posted on this date in earlier years, newest first.
+        description: Their saved spots posted on this date in earlier years, newest first.
       - name: years_ago
         type: array
         item_type: integer
@@ -281,4 +314,4 @@ outcomes:
       - name: nearest_other_date
         type: string
         required: false
-        description: If none match, the saved spot posted nearest to this date.
+        description: If no saved spot matches, the one posted nearest to this date.
