@@ -12,25 +12,25 @@ app_author_name: "Local Ravens"
 app:
   id: hack.app_eba2
   name: London Raven
-  version: 0.2.2
+  version: 0.2.3
   # Never use the word "by" here: the badge is split on it.
   # The chooser reads only the first sentence (about 110 characters), so it
   # names all four; the rest is for people deciding whether to install it.
   summary: >-
-    London weather outfits, jog routes, strike-aware tube journeys, finding
-    places and on-this-day history. Your friendly London neighbour, mate! 1. Weather 🌦️: London weather is famously
-    unpredictable, so ask "do I need an umbrella on Saturday?" and get an emoji
-    outfit, the temperature and when the rain starts. 2. Jogging 🏃: London is
-    full of beautiful parks to run or walk in; ask for "5km from Imperial
-    College and back" and get a route to a park near you. 3. Places and
-    transport 🚇: strikes are common in London; ask "Imperial College to Ealing
-    Broadway" and it shows the routes, which lines are hit and a way round the
-    strike. Saw somewhere interesting online? Describe it, like "ramen near
-    London Bridge", and it finds the place and how to get there. 4. On this day
-    📜: London is a playground of history; ask what happened in London on this
-    date, or for the story of a place like the Tower of London. Uses
-    Open-Meteo, OpenStreetMap, TfL and Wikipedia, and sends only the place
-    names you give.
+    Friendly London neighbour for weather outfits, jog routes, strike-free
+    transport and on-this-day history. 1. Weather! London is famous for its
+    unpredictable weather. Ask it "do I need an umbrella on Saturday?" and it
+    dresses you in emoji for the day, with when the rain starts. 2. Jogging!
+    London has many beautiful spots to exercise or walk around you. Ask it
+    "5km from Imperial College and back" and it plans a route to a park and
+    back. 3. Places and Transport. Strikes are common in London! Ask it
+    "Imperial College to Ealing Broadway" and it shows which lines are hit and
+    proposes a way to go without the strikes. Saw something interesting
+    online? Describe it here, like "ramen near London Bridge", and it tells you
+    where it is and how to get there. 4. On this day. London is a playground of
+    history! Ask what happened in London on this day, or about a place, and it
+    tells you its history. Uses Open-Meteo, OpenStreetMap, TfL and Wikipedia,
+    and sends only the place names you give.
 
 agent_types:
   - personal
