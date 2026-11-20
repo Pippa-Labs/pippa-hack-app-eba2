@@ -204,7 +204,7 @@ def test_an_unknown_place_says_which_place():
     app = app_with({"nominatim": []})
     with pytest.raises(PlaceNotFound) as failure:
         run(app, "london.outfit", {"place": "Narnia"})
-    assert failure.value.user_message == "I could not find Narnia in London."
+    assert failure.value.user_message == "Sorry mate, I couldn't find Narnia in London."
 
 
 def test_a_weather_timeout_is_a_retryable_error():
@@ -234,7 +234,7 @@ def test_no_distance_means_5k():
 def test_a_jog_with_no_start_asks_for_one():
     with pytest.raises(MissingPlace) as failure:
         run(app_with({}), "london.jog", {"distance_km": 5})
-    assert "starting from" in failure.value.user_message
+    assert "setting off from" in failure.value.user_message
 
 
 def test_a_marathon_and_a_half_is_refused():

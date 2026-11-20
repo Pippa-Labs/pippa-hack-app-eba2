@@ -12,13 +12,13 @@ app_author_name: "Local Ravens"
 app:
   id: hack.app_eba2
   name: London Raven
-  version: 0.2.1
+  version: 0.2.2
   # Never use the word "by" here: the badge is split on it.
   # The chooser reads only the first sentence (about 110 characters), so it
   # names all four; the rest is for people deciding whether to install it.
   summary: >-
     London weather outfits, jog routes, strike-aware tube journeys, finding
-    places and on-this-day history. 1. Weather 🌦️: London weather is famously
+    places and on-this-day history. Your friendly London neighbour, mate! 1. Weather 🌦️: London weather is famously
     unpredictable, so ask "do I need an umbrella on Saturday?" and get an emoji
     outfit, the temperature and when the rain starts. 2. Jogging 🏃: London is
     full of beautiful parks to run or walk in; ask for "5km from Imperial

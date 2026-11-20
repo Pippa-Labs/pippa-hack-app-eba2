@@ -63,33 +63,33 @@ STREET_FACTOR = 1.3
 
 
 class PlaceNotFound(AgentAppError):
-    user_message = "I could not find that place in London."
+    user_message = "Sorry mate, I couldn't find that place in London."
     retryable = False
 
 
 class CannotReadDay(AgentAppError):
-    user_message = "I can only forecast the next 7 days. Try a day name like Saturday, or tomorrow."
+    user_message = "Ah, I can only see 7 days ahead, mate. Try a day name like Saturday, or tomorrow."
     retryable = False
 
 
 class MissingPlace(AgentAppError):
-    user_message = "Tell me where you are starting from and where you are going, for example: from Imperial College to Ealing Broadway."
+    user_message = "Where are you off from, and where to, mate? Something like: from Imperial College to Ealing Broadway."
     retryable = False
 
 
 class BadDistance(AgentAppError):
-    user_message = "Pick a run between 1 and 42 km, for example: a 5 km jog from Imperial College."
+    user_message = "Let's keep it between 1 and 42 km, mate (42 is a whole marathon!). Try: a 5 km jog from Imperial College."
     retryable = False
 
 
 class NoJourney(AgentAppError):
-    user_message = "TfL could not find a public transport route between those two places."
+    user_message = "Sorry mate, TfL can't find a public transport route between those two."
     retryable = False
 
 
 class SpotNotFound(AgentAppError):
-    user_message = ("I can't open Instagram links. Tell me the place name, or describe "
-                    "it: what it is and roughly where.")
+    user_message = ("I can't open Instagram links, mate. Tell me the place name, or "
+                    "describe it: what it is and roughly where.")
     retryable = False
 
 
@@ -277,11 +277,11 @@ class SpotsMixin:
                        else f"{found['name']} {data['address']}".strip())
         data["directions_url"] = _maps_link(destination, _latlon(origin) if origin else "")
 
-        narrative = f"📍 {_spot_line(found)}"
+        narrative = f"📍 Found it, mate! {_spot_line(found)}"
         if data["address"]:
             narrative += f", {data['address']}"
         if "distance_km" in data:
-            narrative += f". About {data['distance_km']} km from {origin['name']}"
+            narrative += f". It's about {data['distance_km']} km from {origin['name']}"
             if "transit_minutes" in data:
                 narrative += f", {data['transit_minutes']} min on public transport"
             narrative += f", or about a {data['walk_minutes']} min walk"
@@ -323,7 +323,7 @@ class SpotsMixin:
                                    "countrycodes": "gb", "addressdetails": 1}, timeout)
         if not isinstance(results, list) or not results:
             error = PlaceNotFound(f"nominatim found nothing for {place!r}")
-            error.user_message = f"I could not find {place} in the UK."
+            error.user_message = f"Sorry mate, I couldn't find {place} anywhere in the UK."
             raise error
         first = results[0]
         try:
@@ -352,8 +352,8 @@ class SpotsMixin:
         if not kind or not area_match:
             error = SpotNotFound(f"cannot search for {description!r}")
             if kind:
-                error.user_message = (f"Roughly where is the {kind[3]}? "
-                                      "For example \"near London Bridge\".")
+                error.user_message = (f"Ooh, sounds good! Roughly where's the {kind[3]}, mate? "
+                                      "Say something like \"near London Bridge\".")
             raise error
         area = self._geocode(area_match.group(1).strip(" .?!"), 4.0)
         word, key, value, label = kind
@@ -378,8 +378,8 @@ class SpotsMixin:
                 "lat": lat, "lon": lon}))
         if not found:
             error = SpotNotFound(f"overpass found no {value} near {area['name']!r}")
-            error.user_message = (f"I couldn't find a {label} near {area['name']}. "
-                                  "Do you remember its name?")
+            error.user_message = (f"Couldn't spot a {label} near {area['name']}, mate. "
+                                  "Remember what it's called?")
             raise error
         found.sort(key=lambda item: (item[0], item[1]))
         return [spot for _, _, spot in found[:3]]
@@ -448,13 +448,14 @@ class SpotsMixin:
         if "place_history" in data:
             parts.append(f"🏰 {data['place_history']}")
         elif place:
-            parts.append(f"I found no history page for {place}.")
+            parts.append(f"Couldn't dig up the history of {place}, sorry mate.")
         if history:
-            parts.append(f"📜 On {data['date_checked']} in London: " + "; ".join(history[:3]) + ".")
+            parts.append(f"📜 Ooh, a bit of history! On {data['date_checked']} in London: "
+                         + "; ".join(history[:3]) + ".")
         elif not history_error:
-            parts.append(f"No London events are listed for {data['date_checked']}.")
+            parts.append(f"Quiet one: nothing in London's history books for {data['date_checked']}, mate.")
         if hits:
-            parts.append("📅 Your spots from this date: " + "; ".join(data["spots"]) + ".")
+            parts.append("📅 And from your own spots: " + "; ".join(data["spots"]) + ".")
         return Result(data=data, narrative=" ".join(parts))
 
     def _london_history(self, day: date, place: str) -> list[str]:
@@ -560,7 +561,7 @@ class App(SpotsMixin):
             "https://nominatim.openstreetmap.org/search?" + query, "Nominatim", timeout)
         if not isinstance(results, list) or not results:
             error = PlaceNotFound(f"nominatim found nothing for {place!r}")
-            error.user_message = f"I could not find {place} in London."
+            error.user_message = f"Sorry mate, I couldn't find {place} in London."
             raise error
         first = results[0]
         try:
@@ -648,11 +649,17 @@ class App(SpotsMixin):
             data["rain_timing"] = rain_timing
 
         narrative = (
-            f"Outfit for {name}, {_pretty_day(day)}: {avatar}. {sky_words.capitalize()}, "
+            f"Alright mate! For {name}, {_pretty_day(day)}: {avatar}. {sky_words.capitalize()}, "
             f"{round(t_low)} to {round(t_high)}°C (feels like {round(f_low)} to {round(f_high)}°C), "
             f"{rain_chance}% chance of rain"
             + (f", {rain_timing}" if rain_timing else "") + f". Wear: {outfit}."
         )
+        if rain_chance >= 50:
+            narrative += " Don't forget your brolly! ☂️"
+        elif rain_chance <= 20 and f_high >= 18:
+            narrative += " Lovely day for it! 😎"
+        elif f_high < 5:
+            narrative += " Bit nippy out there, wrap up warm!"
         return Result(data=data, narrative=narrative)
 
     @staticmethod
@@ -748,7 +755,7 @@ class App(SpotsMixin):
         start = (call.inputs.get("start") or "").strip()
         if not start:
             error = MissingPlace("no starting point")
-            error.user_message = "Tell me where you are starting from, for example: a 5 km jog from Imperial College."
+            error.user_message = "Where are you setting off from, mate? Say something like: a 5 km jog from Imperial College."
             raise error
         distance = call.inputs.get("distance_km")
         target = float(distance) if distance not in (None, "") else 5.0
@@ -776,7 +783,7 @@ class App(SpotsMixin):
         nearest_km = _km_between(here, (nearest[1], nearest[2])) * STREET_FACTOR
         if nearest_km > 20:
             error = PlaceNotFound(f"{start!r} is {nearest_km:.0f} km from the nearest park")
-            error.user_message = f"{start} is too far out: I only know running routes in London's parks."
+            error.user_message = f"{start}'s a bit far out, mate. I only know running routes in London's parks."
             raise error
 
         if not options:
@@ -786,7 +793,7 @@ class App(SpotsMixin):
                      f"is about {nearest_km:.1f} km away.")
             data = {"start": name, "distance_km": round(target, 1), "park": "",
                     "route": route, "total_km": round(target, 1)}
-            return Result(data=data, narrative=f"Jogging route from {name}: {route}")
+            return Result(data=data, narrative=f"Right then! No park close enough, so here's a street run from {name}: {route}")
 
         best = options[0]
         route = self._describe_run(name, *best[1:])
@@ -800,7 +807,7 @@ class App(SpotsMixin):
         others = [f"{o[1]} ({o[2]:.1f} km away, then {o[3]:.1f} km inside)" for o in options[1:3]]
         if others:
             data["other_parks"] = "; ".join(others)
-        return Result(data=data, narrative=f"🏃 {target:g} km jogging route from {name}: {route}")
+        return Result(data=data, narrative=f"🏃 Lace up, mate! {target:g} km from {name}: {route} Enjoy the run!")
 
     @staticmethod
     def _describe_run(start, park, out, inside, laps, sight) -> str:
@@ -893,14 +900,14 @@ class App(SpotsMixin):
 
         if problems:
             hit = ", ".join(text.split(":", 1)[0] for text in problems.values())
-            news = f"⚠️ Problems on: {hit}." + (" Your best route is affected." if affected else "")
+            news = f"⚠️ Heads up, mate, trouble on: {hit}." + (" That hits your best route." if affected else "")
         else:
-            news = "✅ No strikes or delays on these lines."
+            news = "✅ Good news, no strikes or delays on these lines!"
         if strike_free:
-            news += f" ✅ Avoid it: {strike_free}."
+            news += f" ✅ Dodge it this way instead: {strike_free}."
         elif affected:
-            news += " Every suggested route uses an affected line, so allow extra time."
-        narrative = f"🚇 {a_name} to {b_name}: {summaries[0]}. {news}"
+            news += " Every route uses an affected line, so give yourself extra time, mate."
+        narrative = f"🚇 Right, {a_name} to {b_name}: {summaries[0]}. {news}"
         return Result(data=data, narrative=narrative)
 
     @staticmethod
